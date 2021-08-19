@@ -1,0 +1,168 @@
+# Объявляем стадии пайплайна
+stages:
+  - "lint"
+  - "chart-test"
+  - "chart-release"
+
+variables:
+  # Выбираем версию kubectl, соответственно используемой версии kubernetes
+  CI_KUBECTL_VER: v1.19.0
+  # Объявляем версии Helm, chart-testing и KinD
+  CI_HELM_VER: v3.6.3
+  CI_CT_VER: v3.4.0
+  CI_KIND_VERSION: v0.11.1
+  # Часть пути, по которому мы в дальнейшем будем подключать Helm-репо
+  CI_HELM_CHANNEL: stable
+  # Название создаваемого кластера kubernetes
+  CI_KIND_CLUSTER_NAME: k8s-test
+  # Для удобства переписываем в переменные имаджи нод с дайджестами
+  # в соответствии с используемой версией KinD
+  CI_KIND_IMAGE_1_17: 'kindest/node:v1.17.17@sha256:66f1d0d91a88b8a001811e2f1054af60eef3b669a9a74f9b6db871f2f1eeed00'
+  CI_KIND_IMAGE_1_18: 'kindest/node:v1.18.19@sha256:7af1492e19b3192a79f606e43c35fb741e520d195f96399284515f077b3b622c'
+  CI_KIND_IMAGE_1_19: 'kindest/node:v1.19.11@sha256:07db187ae84b4b7de440a73886f008cf903fcf5764ba8106a9fd5243d6f32729'
+  CI_KIND_IMAGE_1_20: 'kindest/node:v1.20.7@sha256:cbeaf907fc78ac97ce7b625e4bf0de16e3ea725daf6b04f930bd14c67c671ff9'
+  CI_KIND_IMAGE_1_21: 'kindest/node:v1.21.1@sha256:69860bda5563ac81e3c0057d654b5253219618a22ec3a346306239bba8cfa1a6'
+  # Указываем, какой образ будем использовать в этом пайплайне
+  CI_KIND_IMAGE: $CI_KIND_IMAGE_1_19
+
+# Далее описываем небольшие сниппеты, которые легко переиспользовать в нескольких джобах,
+# а также улучшают читабельность кода.
+.check-and-unshallow: &check-and-unshallow
+  - git version
+  - |
+    if [ -f "$(git rev-parse --git-dir)/shallow" ]; then
+        echo "this is a shallow repository";
+        git fetch --unshallow --prune --prune-tags --verbose
+    else
+        echo "not a shallow repository";
+        git fetch --prune --prune-tags --verbose
+    fi
+  - git rev-parse --verify HEAD
+  - git rev-list HEAD --count
+  - git rev-list HEAD --count --first-parent
+
+.get-kube-binaries: &get-kube-binaries
+  - apk add -U wget
+  - wget -O /usr/local/bin/kind "https://github.com/kubernetes-sigs/kind/releases/download/${CI_KIND_VERSION}/kind-linux-amd64"
+  - chmod +x /usr/local/bin/kind
+  - wget -O /usr/local/bin/kubectl "https://storage.googleapis.com/kubernetes-release/release/${CI_KUBECTL_VER}/bin/linux/amd64/kubectl"
+  - chmod +x /usr/local/bin/kubectl
+
+.install-ct: &install-ct
+  - |
+    export CT_URL="https://github.com/helm/chart-testing/releases/download/${CI_CT_VER}"
+    export CT_TAR_FILE="chart-testing_${CI_CT_VER#v}_linux_amd64.tar.gz"
+    echo "install chart-testing ${CI_CT_VER} from \"${CT_URL}/${CT_TAR_FILE}\""
+    mkdir -p /tmp/ct /etc/ct
+    wget -O "/tmp/${CT_TAR_FILE}" "${CT_URL}/${CT_TAR_FILE}"
+    tar -xzvf "/tmp/${CT_TAR_FILE}" -C /tmp/ct
+    mv /tmp/ct/etc/chart_schema.yaml /etc/ct/chart_schema.yaml
+    mv /tmp/ct/etc/lintconf.yaml /etc/ct/lintconf.yaml
+    mv /tmp/ct/ct /usr/bin/ct
+    rm -rf /tmp/ct
+    ct version
+
+.install-helm: &install-helm
+  - |
+    export HELM_URL="https://get.helm.sh"
+    export HELM_TAR_FILE="helm-${CI_HELM_VER}-linux-amd64.tar.gz"
+    echo "install HELM ${CI_HELM_VER} from \"${HELM_URL}/${HELM_TAR_FILE}\""
+    mkdir -p /tmp/helm
+    wget -O "/tmp/${HELM_TAR_FILE}" "${HELM_URL}/${HELM_TAR_FILE}"
+    tar -xzvf "/tmp/${HELM_TAR_FILE}" -C /tmp/helm
+    mv /tmp/helm/linux-amd64/helm /usr/bin/helm
+    rm -rf /tmp/helm
+    chmod +x /usr/bin/helm
+    helm version
+
+# Добавляем Package Registry проекта с авторизацией через job-token
+# и плагин для push в Helm-репо
+.helm-add-project-as-repo: &helm-add-project-as-repo
+  - >-
+    helm repo add
+    --username gitlab-ci-token
+    --password "${CI_JOB_TOKEN}"
+    "${CI_PROJECT_NAME}"
+    "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/${CI_HELM_CHANNEL}"
+  - helm plugin install https://github.com/chartmuseum/helm-push.git
+  - helm repo list
+
+# Описываем сами джобы
+# Линт. Тут просто берем родной имадж chart-testing, ничего дабавлять не требуется
+chart-lint:
+  stage: lint
+  image: quay.io/helmpack/chart-testing:v3.4.0
+  tags:
+    - "docker"
+  script:
+    - *check-and-unshallow
+    - ct lint --config ct.yaml
+  only:
+    - pushes
+  except:
+    - master
+    - main
+
+# Здесь добавляем все необходимые бинари, поднимаем KinD
+# и разворачиваем в него тестируемые чарты
+chart-test:
+  stage: chart-test
+  image: docker:20.10-git
+  variables:
+    # Use TLS https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#tls-enabled
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+  # Сервис DinD нам не нужен в остальных джобах, поэтому укажем его здесь,
+  # чтобы не замедлять весь пайплайн
+  services:
+    - name: docker:20.10-dind
+      alias: docker
+  tags:
+    - "docker"
+  script:
+    - *check-and-unshallow
+    - apk add -U wget
+    # Добавляем недостающие бинари
+    - *get-kube-binaries
+    - *install-ct
+    - *install-helm
+    # разворачиваем KinD
+    - >-
+      kind create cluster
+      --name ${CI_KIND_CLUSTER_NAME}
+      --image ${CI_KIND_IMAGE}
+      --config=kind-cluster.yaml
+      --wait 5m
+    # Правим kubeconfig, чтобы указанный хост api-server соответствовал хосту DinD,
+    # который, в свою очередь, мы ранее указали в патче ClusterConfiguration
+    - sed -i -E -e 's/127\.0\.0\.1|0\.0\.0\.0/docker/g' "$HOME/.kube/config"
+    # Разворачиваем наши чарты
+    - ct install --config ct.yaml
+  after_script:
+    # не обязательно, т.к. сервис все равно будет погашен с завершением джобы
+    - kind delete cluster --name k8s-test
+  only:
+    - pushes
+  except:
+    - master
+    - main
+
+# Упаковываем чарты и публикуем их в Package Registry
+chart-release:
+  stage: chart-release
+  image: quay.io/helmpack/chart-testing:v3.4.0
+  tags:
+    - "docker"
+  script:
+    - *check-and-unshallow
+    - apk add jq yq
+    - *helm-add-project-as-repo
+    # используем доработанный скрипт из экшена chart-releaser
+    - >-
+      ./gitlab-cr.sh
+      --charts-dir charts
+      --charts-repo-url "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/${CI_HELM_CHANNEL}"
+      --repo "${CI_PROJECT_NAME}"
+  only:
+    - master
+    - main
