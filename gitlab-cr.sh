@@ -196,7 +196,7 @@ release_charts() {
     for f in .cr-release-packages/*.tgz
     do
         [ -e "$f" ] || break
-        helm push "$f" "$repo"
+        helm cm-push "$f" "$repo"
     done
 }
 
